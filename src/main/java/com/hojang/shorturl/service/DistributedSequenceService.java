@@ -27,8 +27,17 @@ public class DistributedSequenceService {
     @EventListener(ApplicationReadyEvent.class)
     public void init() {
         transactionTemplate.executeWithoutResult(status -> {
+            // 1. 없으면 생성
             if (!sequenceRepository.existsById(SEQ_KEY)) {
                 sequenceRepository.save(new GlobalSequence(SEQ_KEY, INITIAL_VALUE));
+            } else {
+                // 2. 있어도 값이 너무 작으면(예: 8000) 강제로 568억으로 보정
+                GlobalSequence seq = sequenceRepository.findByIdWithLock(SEQ_KEY)
+                        .orElseThrow(() -> new IllegalStateException("Sequence not found"));
+
+                if (seq.getMaxId() < INITIAL_VALUE) {
+                    seq.setMaxId(INITIAL_VALUE);
+                }
             }
             allocateNewRange();
         });
