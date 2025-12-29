@@ -1,46 +1,68 @@
-# main.tf
+variable "db_password" {
+  description = "RDS root password"
+  type        = string
+  sensitive   = true  # 터미널 로그에 비밀번호가 노출되지 않게 가려줍니다.
+}
+
+resource "aws_key_pair" "deployer" {
+  key_name   = "short-url-key"
+  public_key = file("${path.module}/short-url-key.pub")
+}
+
+terraform {
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
+    }
+  }
+}
+
+
 
 provider "aws" {
-  region = "ap-northeast-2" # 서울 리전
-}
-
-# 1. 내 컴퓨터 IP 자동 확인 (보안을 위해 내 IP에서만 접속 허용)
-data "http" "myip" {
-  url = "https://ipv4.icanhazip.com"
-}
-
-# 2. 기본 네트워크 정보 가져오기 (AWS 기본 VPC 사용)
-data "aws_vpc" "default" {
-  default = true
+  region = "ap-northeast-2"
 }
 
 # -----------------------------------------------------------
-# 3. 보안 그룹 (방화벽) 설정
+# 1. 최신 우분투 자동 검색 (에러 방지용)
 # -----------------------------------------------------------
+data "aws_ami" "ubuntu" {
+  most_recent = true
+  owners      = ["099720109477"]
 
-# A. 웹 서버(EC2)용 보안 그룹
+  filter {
+    name   = "name"
+    values = ["ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-amd64-server-*"]
+  }
+
+  filter {
+    name   = "virtualization-type"
+    values = ["hvm"]
+  }
+}
+
+# -----------------------------------------------------------
+# 2. 보안 그룹 (SSH/Web 전체 허용)
+# -----------------------------------------------------------
 resource "aws_security_group" "web_sg" {
-  name        = "shorturl-web-sg-final"
-  description = "Allow HTTP/SSH from My IP"
-  vpc_id      = data.aws_vpc.default.id
+  name        = "shorturl-web-sg-final-v2" # 이름 충돌 방지 위해 v2로 변경
+  description = "Allow HTTP and SSH traffic"
 
-  # SSH 접속 허용
   ingress {
-    description = "SSH"
     from_port   = 22
     to_port     = 22
     protocol    = "tcp"
-    cidr_blocks = ["${chomp(data.http.myip.response_body)}/32"]
+    cidr_blocks = ["0.0.0.0/0"] # 접속 편의성
   }
-  # 웹 접속 허용
+
   ingress {
-    description = "HTTP App"
     from_port   = 8080
     to_port     = 8080
     protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
+    cidr_blocks = ["0.0.0.0/0"] # 웹 테스트용
   }
-  # 밖으로 나가는 건 모두 허용
+
   egress {
     from_port   = 0
     to_port     = 0
@@ -49,74 +71,163 @@ resource "aws_security_group" "web_sg" {
   }
 }
 
-# B. 데이터베이스(RDS)용 보안 그룹
-resource "aws_security_group" "db_sg" {
-  name        = "shorturl-rds-sg-final"
-  description = "Allow MySQL from Web Server only"
-  vpc_id      = data.aws_vpc.default.id
-
-  # 오직 '웹 서버(web_sg)'에서 오는 신호만 받음 (보안 핵심!)
-  ingress {
-    description     = "MySQL from EC2"
-    from_port       = 3306
-    to_port         = 3306
-    protocol        = "tcp"
-    security_groups = [aws_security_group.web_sg.id]
-  }
-}
-
 # -----------------------------------------------------------
-# 4. 리소스 생성 (RDS & EC2)
+# 3. IAM Role (EC2 권한 - 도커/로그/SSM)
 # -----------------------------------------------------------
+resource "aws_iam_role" "ec2_role" {
+  name = "short-url-ec2-role"
 
-# A. RDS 인스턴스 (MySQL)
-resource "aws_db_instance" "default" {
-  identifier           = "shorturl-db"
-  allocated_storage    = 20             # 프리티어 최대 용량
-  engine               = "mysql"
-  engine_version       = "8.0"
-  instance_class       = "db.t3.micro"  # 프리티어 대상 인스턴스
-  username             = "admin"
-  password             = "ShortUrlPass123!" # 실습용 비밀번호 (복잡하게 설정 필요)
-  parameter_group_name = "default.mysql8.0"
-  skip_final_snapshot  = true           # 삭제 시 스냅샷 생성 안 함 (빠른 삭제)
-  publicly_accessible  = false          # 외부 접속 차단 (EC2 통해서만 접속)
-
-  vpc_security_group_ids = [aws_security_group.db_sg.id]
-}
-
-# B. EC2 인스턴스 (Spring Boot 서버)
-resource "aws_instance" "app_server" {
-  ami           = "ami-0c9c942bd7bf113a2" # Ubuntu 22.04 LTS (서울 리전 기준)
-  instance_type = "t3.micro"
-
-  # ★ 비용 폭탄 방지: CPU 크레딧 모드를 'Standard'로 고정
-  credit_specification {
-    cpu_credits = "standard"
-  }
-
-  vpc_security_group_ids = [aws_security_group.web_sg.id]
-
-  # ★ 서버가 켜질 때 실행할 스크립트 연결
-  # RDS 접속 정보를 user_data.sh 파일에 변수로 넘겨줍니다.
-  user_data = templatefile("${path.module}/user_data.sh", {
-    rds_endpoint = aws_db_instance.default.address
-    db_username  = aws_db_instance.default.username
-    db_password  = aws_db_instance.default.password
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Action = "sts:AssumeRole"
+        Effect = "Allow"
+        Principal = { Service = "ec2.amazonaws.com" }
+      }
+    ]
   })
+}
 
-  # 스크립트 변경 시 인스턴스 재생성하도록 설정 (선택사항)
-  user_data_replace_on_change = true
+# 정책 연결 (ECR, CloudWatch, SSM)
+resource "aws_iam_role_policy_attachment" "ecr_readonly" {
+  role       = aws_iam_role.ec2_role.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly"
+}
+resource "aws_iam_role_policy_attachment" "cloudwatch_agent" {
+  role       = aws_iam_role.ec2_role.name
+  policy_arn = "arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy"
+}
+resource "aws_iam_role_policy_attachment" "ssm_core" {
+  role       = aws_iam_role.ec2_role.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+}
+
+resource "aws_iam_instance_profile" "ec2_profile" {
+  name = "short-url-ec2-profile"
+  role = aws_iam_role.ec2_role.name
+}
+
+# -----------------------------------------------------------
+# 4. RDS (데이터베이스)
+# -----------------------------------------------------------
+resource "aws_db_instance" "default" {
+  allocated_storage      = 10
+  db_name                = "shorturl"
+  engine                 = "mysql"
+  engine_version         = "8.0"
+  instance_class         = "db.t3.micro"
+  username               = "admin"
+  password               = var.db_password
+  parameter_group_name   = "default.mysql8.0"
+  skip_final_snapshot    = true
+  publicly_accessible    = true
+  vpc_security_group_ids = [aws_security_group.web_sg.id]
+}
+
+# -----------------------------------------------------------
+# 5. ECR (도커 이미지 저장소)
+# -----------------------------------------------------------
+resource "aws_ecr_repository" "app_repo" {
+  name         = "short-url-repo"
+  force_delete = true
+  image_scanning_configuration {
+    scan_on_push = true
+  }
+}
+
+# -----------------------------------------------------------
+# 6. EC2 인스턴스 (도커 설치 스크립트 내장)
+# -----------------------------------------------------------
+resource "aws_instance" "app_server" {
+  ami                    = data.aws_ami.ubuntu.id
+  instance_type          = "t3.micro"
+  key_name               = "short-url-key"
+  vpc_security_group_ids = [aws_security_group.web_sg.id]
+  iam_instance_profile   = aws_iam_instance_profile.ec2_profile.name
+
+  # User Data: 도커 및 모니터링 에이전트 자동 설치
+  user_data = <<-EOF
+    #!/bin/bash
+    exec > >(tee /var/log/user-data.log|logger -t user-data -s 2>/dev/console) 2>&1
+
+    # 기본 패키지
+    sudo apt-get update -y
+    sudo apt-get install -y ca-certificates curl gnupg unzip git
+
+    # Docker 설치
+    sudo install -m 0755 -d /etc/apt/keyrings
+    curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+    sudo chmod a+r /etc/apt/keyrings/docker.gpg
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+    sudo apt-get update
+    sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+
+    # Docker 권한 및 실행
+    sudo usermod -aG docker ubuntu
+    sudo systemctl start docker
+    sudo systemctl enable docker
+
+    # CloudWatch Agent 설치 (메모리 모니터링)
+    wget https://s3.amazonaws.com/amazoncloudwatch-agent/ubuntu/amd64/latest/amazon-cloudwatch-agent.deb
+    sudo dpkg -i amazon-cloudwatch-agent.deb
+
+    # Config 생성
+    sudo mkdir -p /opt/aws/amazon-cloudwatch-agent/etc/
+    cat <<CONFIG | sudo tee /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json
+    {
+      "agent": { "metrics_collection_interval": 60, "run_as_user": "root" },
+      "metrics": {
+        "append_dimensions": { "InstanceId": "$${aws:InstanceId}", "InstanceType": "$${aws:InstanceType}" },
+        "metrics_collected": {
+          "mem": { "measurement": ["mem_used_percent"], "metrics_collection_interval": 60 },
+          "disk": { "measurement": ["used_percent"], "resources": ["/"], "metrics_collection_interval": 60 }
+        }
+      }
+    }
+CONFIG
+
+    # Agent 실행
+    sudo /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -s -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json
+  EOF
 
   tags = {
-    Name = "ShortUrl-App-Server"
+    Name = "ShortUrl-Docker-Server"
   }
-
-  # DB가 먼저 만들어져야 서버를 띄움
-  depends_on = [aws_db_instance.default]
 }
 
-# 5. 결과 출력 (접속 주소)
-output "website_url" {
-  value = "http://${aws_instance.app_server.public_ip}:8080"
+# -----------------------------------------------------------
+# 7. CloudWatch 대시보드 (자동 생성)
+# -----------------------------------------------------------
+resource "aws_cloudwatch_dashboard" "main" {
+  dashboard_name = "ShortUrl-Dashboard"
+  dashboard_body = jsonencode({
+    widgets = [
+      {
+        type = "metric", x = 0, y = 0, width = 12, height = 6,
+        properties = {
+          view = "timeSeries", stacked = false, region = "ap-northeast-2", title = "EC2 Resources",
+          metrics = [
+            ["AWS/EC2", "CPUUtilization", "InstanceId", aws_instance.app_server.id],
+            ["CWAgent", "mem_used_percent", "InstanceId", aws_instance.app_server.id, "InstanceType", "t3.micro"]
+          ],
+          yAxis = { left = { min = 0, max = 100 } }
+        }
+      },
+      {
+        type = "metric", x = 12, y = 0, width = 12, height = 6,
+        properties = {
+          view = "timeSeries", stacked = false, region = "ap-northeast-2", title = "RDS CPU",
+          metrics = [ ["AWS/RDS", "CPUUtilization", "DBInstanceIdentifier", aws_db_instance.default.identifier] ]
+        }
+      }
+    ]
+  })
 }
+
+# -----------------------------------------------------------
+# 8. Outputs
+# -----------------------------------------------------------
+output "ecr_url" { value = aws_ecr_repository.app_repo.repository_url }
+output "website_url" { value = "http://${aws_instance.app_server.public_ip}:8080" }
+output "rds_endpoint" { value = aws_db_instance.default.endpoint }

@@ -40,4 +40,4 @@ out/
 *.tfstate
 *.tfstate.backup
 *.tfvars
-*.pem
+*.pemshort-url-key*
